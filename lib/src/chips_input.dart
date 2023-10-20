@@ -1,10 +1,10 @@
 import 'dart:async';
-import 'dart:io' show Platform;
 import 'dart:math';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_keyboard_visibility/flutter_keyboard_visibility.dart';
 
 import 'suggestions_box_controller.dart';
 import 'text_cursor.dart';
@@ -14,7 +14,10 @@ typedef ChipsInputSuggestions<T> = FutureOr<List<T>> Function(String query);
 
 /// Return a widget to represent the given value.
 typedef ChipsBuilder<T> = Widget Function(
-    BuildContext context, ChipsInputState<T> state, T data);
+  BuildContext context,
+  ChipsInputState<T> state,
+  T data,
+);
 
 const kObjectReplacementChar = 0xFFFD;
 
@@ -52,7 +55,8 @@ class ChipsInput<T> extends StatefulWidget {
     required this.onChanged,
     this.maxChips,
     this.textStyle,
-    this.maxHeight,
+    this.maxHeight = 40,
+    this.minHeight = 40,
     this.suggestionsBoxMaxHeight,
     this.inputType = TextInputType.text,
     this.textOverflow = TextOverflow.clip,
@@ -61,15 +65,16 @@ class ChipsInput<T> extends StatefulWidget {
     this.ensureVisible = true,
     this.actionLabel,
     this.inputAction = TextInputAction.done,
-    this.keyboardAppearance = Brightness.light,
+    this.keyboardAppearance = Brightness.dark,
     this.textCapitalization = TextCapitalization.none,
     this.autofocus = false,
     this.allowChipEditing = false,
-    this.userFocusNode,
+    this.focusNode,
     this.initialSuggestions,
-    this.suggestionsBoxElevation = 0,
+    this.suggestionsBoxElevation = 20,
     this.suggestionsBoxDecoration = const BoxDecoration(),
     this.showKeyboard = true,
+    this.controller,
   })  : assert(maxChips == null || initialValue.length <= maxChips),
         super(key: key);
 
@@ -102,7 +107,12 @@ class ChipsInput<T> extends StatefulWidget {
   /// Maximum height for the input field containing the values and cursor.
   ///
   /// This translates directly into the height of the blinking cursor.
-  final double? maxHeight;
+  final double maxHeight;
+
+  /// Maximum height for the input field containing the values and cursor.
+  ///
+  /// This translates directly into the height of the blinking cursor.
+  final double minHeight;
 
   /// Maximum height for the suggestions overlay.
   final double? suggestionsBoxMaxHeight;
@@ -116,7 +126,7 @@ class ChipsInput<T> extends StatefulWidget {
   /// Whether to hide the text being edited (e.g., for passwords).
   final bool obscureText;
 
-  /// Whether to enable auto-correction or not.
+  /// Whether to enable autocorrection.
   final bool autocorrect;
 
   /// What text to display in the text input control's action button.
@@ -145,7 +155,7 @@ class ChipsInput<T> extends StatefulWidget {
   final BoxDecoration suggestionsBoxDecoration;
 
   /// Defines the keyboard focus for this widget.
-  final FocusNode? userFocusNode;
+  final FocusNode? focusNode;
 
   /// Set of values to suggest when field first receives focus.
   final List<T>? initialSuggestions;
@@ -156,6 +166,8 @@ class ChipsInput<T> extends StatefulWidget {
   /// Configures how the platform keyboard will select an uppercase or lowercase
   /// keyboard.
   final TextCapitalization textCapitalization;
+
+  final SuggestionsBoxController? controller;
 
   @override
   ChipsInputState<T> createState() => ChipsInputState<T>();
@@ -171,12 +183,15 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   List<T?>? _suggestions;
   final StreamController<List<T?>?> _suggestionsStreamController =
       StreamController<List<T>?>.broadcast();
+  late StreamSubscription<bool> _keyboardVisibilityStream;
   int _searchId = 0;
-  TextEditingValue _value = const TextEditingValue();
+  TextEditingValue _value = TextEditingValue.empty;
   TextInputConnection? _textInputConnection;
   late SuggestionsBoxController _suggestionsBoxController;
   final _layerLink = LayerLink();
   final Map<T?, String> _enteredTexts = <T, String>{};
+  T? _selectedSuggestion;
+  int _cursorIndex = 0;
 
   TextInputConfiguration get textInputConfiguration => TextInputConfiguration(
         inputType: widget.inputType,
@@ -193,9 +208,9 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   bool get _hasReachedMaxChips =>
       widget.maxChips != null && _chips.length >= widget.maxChips!;
 
-  FocusNode? _defaultFocusNode;
+  FocusNode? _focusNode;
   FocusNode get _effectiveFocusNode =>
-      widget.userFocusNode ?? (_defaultFocusNode ??= FocusNode());
+      widget.focusNode ?? (_focusNode ??= FocusNode());
   late FocusAttachment _nodeAttachment;
 
   RenderBox? get renderBox => context.findRenderObject() as RenderBox?;
@@ -205,11 +220,9 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   @override
   void initState() {
     super.initState();
-    _chips.addAll(widget.initialValue);
-    _suggestions = widget.initialSuggestions
-        ?.where((r) => !_chips.contains(r))
-        .toList(growable: false);
-    _suggestionsBoxController = SuggestionsBoxController(context);
+    initSuggestionsChips();
+    _suggestionsBoxController =
+        widget.controller ?? SuggestionsBoxController(context);
     _effectiveFocusNode.addListener(_handleFocusChanged);
     _nodeAttachment = _effectiveFocusNode.attach(context);
     _effectiveFocusNode.canRequestFocus = _canRequestFocus;
@@ -220,20 +233,28 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
         FocusScope.of(context).autofocus(_effectiveFocusNode);
       }
     });
+    _keyboardVisibilityStream =
+        KeyboardVisibilityController().onChange.listen((bool visible) {
+      if (!visible) {
+        _suggestionsBoxController.close();
+        _focusNode?.unfocus();
+      }
+    });
   }
 
   @override
   void dispose() {
     _closeInputConnectionIfNeeded();
     _effectiveFocusNode.removeListener(_handleFocusChanged);
-    _defaultFocusNode?.dispose();
+    _focusNode?.dispose();
     _suggestionsStreamController.close();
     _suggestionsBoxController.close();
+    _keyboardVisibilityStream.cancel();
     super.dispose();
   }
 
   void _handleFocusChanged() {
-    if (_effectiveFocusNode.hasFocus) {
+    if (_focusNode?.hasFocus ?? false) {
       if (widget.showKeyboard) {
         _openInputConnection();
       }
@@ -252,6 +273,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   void requestKeyboard() {
     if (_effectiveFocusNode.hasFocus) {
       _openInputConnection();
+      _suggestionsBoxController.open();
     } else {
       FocusScope.of(context).requestFocus(_effectiveFocusNode);
     }
@@ -268,6 +290,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
             mq.viewInsets.bottom -
             renderBoxOffset.dy -
             size.height;
+
         var suggestionBoxHeight = max(topAvailableSpace, bottomAvailableSpace);
         if (widget.suggestionsBoxMaxHeight != null) {
           suggestionBoxHeight =
@@ -277,53 +300,71 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
         final compositedTransformFollowerOffset =
             showTop ? Offset(0, -size.height) : Offset.zero;
 
-        return StreamBuilder<List<T?>?>(
-          stream: _suggestionsStreamController.stream,
-          initialData: _suggestions,
-          builder: (context, snapshot) {
-            if (snapshot.hasData && snapshot.data!.isNotEmpty) {
-              final suggestionsListView = Material(
-                elevation: widget.suggestionsBoxElevation,
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxHeight: suggestionBoxHeight,
-                  ),
-                  child: DecoratedBox(
-                    decoration: widget.suggestionsBoxDecoration,
-                    child: ListView.builder(
-                      shrinkWrap: true,
-                      padding: EdgeInsets.zero,
-                      itemCount: snapshot.data!.length,
-                      itemBuilder: (BuildContext context, int index) {
-                        return _suggestions != null
-                            ? widget.suggestionBuilder(
-                                context,
-                                this,
-                                _suggestions![index] as T,
-                              )
-                            : Container();
-                      },
-                    ),
-                  ),
-                ),
-              );
-              return Positioned(
-                width: size.width,
-                child: CompositedTransformFollower(
-                  link: _layerLink,
-                  showWhenUnlinked: false,
-                  offset: compositedTransformFollowerOffset,
-                  child: !showTop
-                      ? suggestionsListView
-                      : FractionalTranslation(
-                          translation: const Offset(0, -1),
-                          child: suggestionsListView,
+        return Stack(
+          children: [
+            ModalBarrier(
+              onDismiss: () {
+                _suggestionsBoxController.close();
+              },
+            ),
+            StreamBuilder<List<T?>?>(
+              stream: _suggestionsStreamController.stream,
+              initialData: _suggestions,
+              builder: (context, snapshot) {
+                if (snapshot.hasData && snapshot.data!.isNotEmpty) {
+                  final suggestionsListView = Material(
+                    elevation: widget.suggestionsBoxElevation,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: suggestionBoxHeight,
+                      ),
+                      child: DecoratedBox(
+                        decoration: widget.suggestionsBoxDecoration,
+                        child: ListView.builder(
+                          shrinkWrap: true,
+                          padding: EdgeInsets.zero,
+                          itemCount: snapshot.data!.length,
+                          itemBuilder: (BuildContext context, int index) {
+                            if (_suggestions != null) {
+                              final suggestion = _suggestions![index] as T;
+
+                              return ListTile(
+                                title: widget.suggestionBuilder(
+                                  context,
+                                  this,
+                                  suggestion,
+                                ),
+                                selected: _selectedSuggestion == suggestion,
+                                selectedTileColor: Colors.grey.withOpacity(0.2),
+                                onTap: () => selectSuggestion(suggestion),
+                              );
+                            } else {
+                              return Container();
+                            }
+                          },
                         ),
-                ),
-              );
-            }
-            return Container();
-          },
+                      ),
+                    ),
+                  );
+                  return Positioned(
+                    width: size.width,
+                    child: CompositedTransformFollower(
+                      link: _layerLink,
+                      showWhenUnlinked: false,
+                      offset: compositedTransformFollowerOffset,
+                      child: !showTop
+                          ? suggestionsListView
+                          : FractionalTranslation(
+                              translation: const Offset(0, -1),
+                              child: suggestionsListView,
+                            ),
+                    ),
+                  );
+                }
+                return Container();
+              },
+            ),
+          ],
         );
       },
     );
@@ -332,31 +373,47 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   /// Add the provided value to the list of values in the widget.
   void selectSuggestion(T data) {
     if (!_hasReachedMaxChips) {
-      setState(() => _chips.add(data));
+      setState(() => _chips = _chips..add(data));
       if (widget.allowChipEditing) {
         final enteredText = _value.normalCharactersText;
-        if (enteredText.isNotEmpty) _enteredTexts[data] = enteredText;
+        if (enteredText.isNotEmpty) {
+          _enteredTexts[data] = enteredText;
+        }
       }
       _updateTextInputState(replaceText: true);
-      setState(() => _suggestions = null);
+      setState(() {
+        _suggestions?.remove(data);
+
+        if (_suggestions?.isNotEmpty ?? false) {
+          _selectedSuggestion = _suggestions?.first;
+        }
+        _cursorIndex += 1;
+      });
       _suggestionsStreamController.add(_suggestions);
       if (_hasReachedMaxChips) _suggestionsBoxController.close();
+      widget.onChanged(_chips.toList());
     } else {
       _suggestionsBoxController.close();
     }
-    widget.onChanged(_chips.toList(growable: false));
+    widget.onChanged(_chips.toList());
     if (!widget.showKeyboard) {
-      _effectiveFocusNode.unfocus();
+      _focusNode?.unfocus();
     }
   }
 
   /// Remove the chip that represents the given value, if any.
   void deleteChip(T data) {
     if (widget.enabled) {
-      setState(() => _chips.remove(data));
+      setState(() {
+        _cursorIndex -= 1;
+        _chips.remove(data);
+        _suggestions?.add(data);
+      });
       if (_enteredTexts.containsKey(data)) _enteredTexts.remove(data);
       _updateTextInputState();
-      widget.onChanged(_chips.toList(growable: false));
+      _suggestionsBoxController.overlayEntry?.markNeedsBuild();
+
+      widget.onChanged(_chips.toList());
     }
   }
 
@@ -377,7 +434,9 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   void _scrollToVisible() {
     Future.delayed(const Duration(milliseconds: 300), () {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        final renderBox = context.findRenderObject() as RenderBox;
+        final renderBox = context.findRenderObject();
+
+        if (renderBox == null || renderBox is! RenderBox) return;
         await Scrollable.of(context)
             .position
             .ensureVisible(renderBox)
@@ -390,12 +449,19 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
     });
   }
 
-  void _onSearchChanged(String value) async {
+  Future<void> _onSearchChanged(String value) async {
     final localId = ++_searchId;
     final results = await widget.findSuggestions(value);
+    results.removeWhere((element) => _chips.contains(element));
+
     if (_searchId == localId && mounted) {
-      setState(() => _suggestions =
-          results.where((r) => !_chips.contains(r)).toList(growable: false));
+      setState(
+        () {
+          _suggestions = results.where((r) => !_chips.contains(r)).toList();
+          _selectedSuggestion =
+              (_suggestions?.isNotEmpty ?? false) ? _suggestions!.first : null;
+        },
+      );
     }
     _suggestionsStreamController.add(_suggestions ?? []);
     if (!_suggestionsBoxController.isOpened && !_hasReachedMaxChips) {
@@ -417,14 +483,17 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
       setState(() => _value = value);
       if (value.replacementCharactersCount <
               oldTextEditingValue.replacementCharactersCount &&
-          _chips.isNotEmpty) {
-        final removedChip = _chips.last;
-        setState(() =>
-            _chips = Set.of(_chips.take(value.replacementCharactersCount)));
-        widget.onChanged(_chips.toList(growable: false));
-        String? putText = '';
+          _chips.isNotEmpty &&
+          _cursorIndex > 0) {
+        _cursorIndex -= 1;
+        final removedChip = _chips.toList()[_cursorIndex];
+        setState(
+          () => _chips.remove(removedChip),
+        );
+        widget.onChanged(_chips.toList());
+        String putText = '';
         if (widget.allowChipEditing && _enteredTexts.containsKey(removedChip)) {
-          putText = _enteredTexts[removedChip]!;
+          putText = _enteredTexts[removedChip] ?? '';
           _enteredTexts.remove(removedChip);
         }
         _updateTextInputState(putText: putText);
@@ -443,10 +512,12 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
         String.fromCharCodes(_chips.map((_) => kObjectReplacementChar)) +
             (replaceText ? '' : _value.normalCharactersText) +
             putText;
-    setState(() => _value = TextEditingValue(
-          text: updatedText,
-          selection: TextSelection.collapsed(offset: updatedText.length),
-        ));
+    setState(
+      () => _value = TextEditingValue(
+        text: updatedText,
+        selection: TextSelection.collapsed(offset: updatedText.length),
+      ),
+    );
     if (!kIsWeb) {
       _closeInputConnectionIfNeeded();
     }
@@ -454,15 +525,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
     if (_textInputConnection?.attached ?? false) {
       _textInputConnection?.setEditingState(_value);
     }
-    //
-    // Showing the text input will display the on-screen keyboard even if the
-    // widget does not have focus. However, not showing the input means the
-    // keyboard will disappear on iOS with each key press. A better solution
-    // would be nice.
-    //
-    if (!kIsWeb && Platform.isIOS) {
-      _textInputConnection?.show();
-    }
+    _textInputConnection?.show();
   }
 
   @override
@@ -472,16 +535,26 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
       case TextInputAction.go:
       case TextInputAction.send:
       case TextInputAction.search:
-        if (_suggestions?.isNotEmpty ?? false) {
-          selectSuggestion(_suggestions!.first as T);
-        } else {
-          _effectiveFocusNode.unfocus();
+        if (_selectedSuggestion != null) {
+          selectSuggestion(_selectedSuggestion as T);
+          _onSearchChanged('');
         }
+
         break;
       default:
         _effectiveFocusNode.unfocus();
         break;
     }
+  }
+
+  void initSuggestionsChips() {
+    _chips.clear();
+    _chips.addAll(widget.initialValue);
+    _cursorIndex = _chips.length;
+    _suggestions =
+        widget.initialSuggestions?.where((r) => !_chips.contains(r)).toList();
+    _selectedSuggestion =
+        _suggestions?.isNotEmpty == true ? _suggestions!.first : null;
   }
 
   @override
@@ -497,6 +570,9 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
   void didUpdateWidget(covariant ChipsInput<T> oldWidget) {
     super.didUpdateWidget(oldWidget);
     _effectiveFocusNode.canRequestFocus = _canRequestFocus;
+    if (oldWidget.initialSuggestions != widget.initialSuggestions) {
+      initSuggestionsChips();
+    }
   }
 
   @override
@@ -523,17 +599,16 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
 
     final theme = Theme.of(context);
 
-    chipsChildren.add(
+    chipsChildren.insert(
+      _cursorIndex,
       ConstrainedBox(
         constraints: BoxConstraints(
-          maxHeight: widget.maxHeight ?? 36,
+          maxHeight: widget.maxHeight,
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.center,
           children: <Widget>[
             Flexible(
-              flex: 1,
               child: Text(
                 _value.normalCharactersText,
                 maxLines: 1,
@@ -551,36 +626,65 @@ class ChipsInputState<T> extends State<ChipsInput<T>> with TextInputClient {
       ),
     );
 
-    return RawKeyboardListener(
-      focusNode: _effectiveFocusNode,
-      onKey: (event) {
-        final str = currentTextEditingValue.text;
-        // seems like the browser handles backspace already, so doing the same
-        // here results in deleting two chips at once
-        if (!kIsWeb &&
-            event.runtimeType.toString() == 'RawKeyDownEvent' &&
-            event.logicalKey == LogicalKeyboardKey.backspace &&
-            str.isNotEmpty) {
-          final sd = str.substring(0, str.length - 1);
-          final sel = TextSelection.collapsed(offset: sd.length);
-          updateEditingValue(TextEditingValue(text: sd, selection: sel));
-        }
-      },
-      child: NotificationListener<SizeChangedLayoutNotification>(
-        onNotification: (SizeChangedLayoutNotification val) {
-          WidgetsBinding.instance.addPostFrameCallback((_) async {
-            _suggestionsBoxController.overlayEntry?.markNeedsBuild();
-          });
-          return true;
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.escape): () {
+          _effectiveFocusNode.unfocus();
+          _suggestionsBoxController.close();
         },
+        const SingleActivator(LogicalKeyboardKey.arrowDown): () {
+          if ((_suggestions?.isNotEmpty ?? false) &&
+              _suggestionsBoxController.isOpened) {
+            final index = _suggestions?.indexOf(_selectedSuggestion) ?? 0;
+            setState(() {
+              if (index < _suggestions!.length - 1) {
+                _selectedSuggestion = _suggestions?[index + 1];
+              } else {
+                _selectedSuggestion = _suggestions?[0];
+              }
+              _suggestionsBoxController.overlayEntry?.markNeedsBuild();
+            });
+          }
+        },
+        const SingleActivator(LogicalKeyboardKey.arrowUp): () {
+          if ((_suggestions?.isNotEmpty ?? false) &&
+              _suggestionsBoxController.isOpened) {
+            final index = _suggestions?.indexOf(_selectedSuggestion) ?? 0;
+
+            setState(() {
+              if (index > 0) {
+                _selectedSuggestion = _suggestions?[index - 1];
+              } else {
+                _selectedSuggestion =
+                    _suggestions?[(_suggestions?.length ?? 1) - 1];
+              }
+              _suggestionsBoxController.overlayEntry?.markNeedsBuild();
+            });
+          }
+        },
+        const SingleActivator(LogicalKeyboardKey.arrowLeft): () {
+          if (_cursorIndex > 0) {
+            setState(() {
+              _cursorIndex -= 1;
+            });
+          }
+        },
+        const SingleActivator(LogicalKeyboardKey.arrowRight): () {
+          if (_cursorIndex < _chips.length) {
+            setState(() {
+              _cursorIndex += 1;
+            });
+          }
+        },
+      },
+      child: Focus(
+        focusNode: _focusNode,
         child: SizeChangedLayoutNotifier(
           child: Column(
             children: <Widget>[
               GestureDetector(
                 behavior: HitTestBehavior.opaque,
-                onTap: () {
-                  requestKeyboard();
-                },
+                onTap: requestKeyboard,
                 child: InputDecorator(
                   decoration: widget.decoration,
                   isFocused: _effectiveFocusNode.hasFocus,
